@@ -1,11 +1,39 @@
-# apiserver-watcher
+# apiserver-watcher / openshift-${platform}-routes
+
+## Intro
+
+On cloud platforms, the installer creates internal and external cloud
+load balancers for the apiserver. On some platforms, the internal load
+balancer needs some special handling in order to work correctly.
 
 ## Background
 
-Some cloud provider load balancers need special handling for hairpin scenarios.
-Because default OpenShift installations are "self-driving", i.e. the control 
-plane is hosted as part of the cluster, we rely on hairpin extensively.
+### DNAT vs Direct Server Return
 
+On most platforms, load balancers DNAT incoming traffic to the
+destination node. However, on some platforms, they instead just
+forward it to the destination with the packets still having the IP of
+the load balancer as their destination IP. This allows "Direct Server
+Return", where the reply packet goes directly back to the client
+rather than needing to pass through the load balancer again, but it
+requires that the node take some action to know that it should be
+accepting packets addressed to the load balancer IP.
+
+Currently GCP is the only OpenShift platform whose internal apiserver
+load balancer is configured this way. The [`openshift-gcp-routes`]
+service handles this by creating iptables rules to redirect inbound
+load-balancer IP packets to the node IP (the same way that kube-proxy
+does for load balancer IPs used by Kubernetes Services).
+
+[`openshift-gcp-routes`]: ../../templates/master/00-master/gcp/files/opt-libexec-openshift-gcp-routes-sh.yaml
+
+### Hairpin
+
+Because default OpenShift installations are "self-driving", i.e. the
+control plane is hosted as part of the cluster, we rely extensively on
+"hairpin" apiserver connections (where a connection is addressed to
+the apiserver load balancer, but ends up redirected back to the node
+that it came from):
 
 ```
  +---------------+
@@ -21,66 +49,66 @@ plane is hosted as part of the cluster, we rely on hairpin extensively.
  +---------------+
 ```
 
-We have iptables workarounds to fix these scenarios, but they need to know when
-the local apiserver is up or down. Hence, the apiserver-watcher.
+On Azure and Alibaba Cloud, a hairpin connection like this will not
+work, because the load balancer DNATs the packet but does not SNAT it.
+As a result, the kubelet sends out a packet with source `${node_ip}`
+and destination `${loadbalancer_ip}` but the apiserver receives a
+packet with source `${node_ip}` and destination `${node_ip}`. When it
+tries to send the reply back, the kernel believes it should be able to
+immediately deliver the packet locally, but this fails because there
+is no client with a matching 5-tuple. (This does not happen for
+non-hairpin connections because in that case the reply will pass
+through the cloud network again, and so the cloud can un-DNAT it.)
 
-### GCP
+The [`openshift-azure-routes`] service (and
+[`openshift-alibaba-routes`] which is basically identical) handles
+this by intercepting outbound connections to the apiserver load
+balancer IP, and always redirecting them to the local apiserver,
+completely ignoring the cloud load balancer.
 
-Google cloud load balancer is a L3LB that is special. It doesn't do DNAT; instead, it
-just redirects traffic to backends and preserves the VIP as the destination IP.
+On GCP, hairpin connections _do_ work, but only because the load
+balancer will SNAT them. Since we don't want that,
+`openshift-gcp-routes` also intercepts and redirects apiserver
+connections in the same way we do on Azure and Alibaba.
 
-So, an agent exists on the node. It programs the node (either via iptables or routing tables) to
-accept traffic destined for the VIP. However, this has a problem: all hairpin traffic
-to the balanced servce is *always* handled by that backend, even if it is down
-or otherwise out of rotation.
+[`openshift-azure-routes`]: ../../templates/master/00-master/azure/files/opt-libexec-openshift-azure-routes-sh.yaml
+[`openshift-alibaba-routes`]: ../../templates/master/00-master/alibaba/files/opt-libexec-openshift-alibaba-routes-sh.yaml
 
-We want to withdraw the internal API service from google-routes redirection when
-it's down, or else the node (i.e. kubelet) loses access to the apiserver VIP
-and becomes unmanagable.
+## apiserver-watch Functionality
 
+In all of the cases above, we need to redirect local clients to the
+local apiserver when it is running, but allow them to reach a remote
+apiserver when there is no local one.
 
-See `templates/master/00-master/gcp/files/opt-libexec-openshift-gcp-routes-sh.yaml`
+The apiserver-watcher runs as a static pod on all the masters, and
+monitors the apiserver's `/readyz` endpoint. (See the [kube-apiserver
+healthcheck] documentation for more information about that.)
 
-### Azure
+When `/readyz` reports that the apiserver is ready, apiserver-watcher
+will create a file `/run/cloud-routes/$VIP.up` for each load balancer
+IP used by the internal apiserver load balancer. When the apiserver is
+not ready, it will remove `$VIP.up` and create
+`/run/cloud-routes/$VIP.down`.
 
-Azure L3LB does do DNAT, which presents a different problem: we can never reply
-to hairpinned traffic. The problem looks something like this:
+The `openshift-gcp-routes`, `openshift-azure-routes`, and
+`openshift-alibaba-routes` services use systemd path activation to run
+any time a file in `/run/cloud-routes` changes, to update their
+iptables rules as needed.
 
-```
-TCP SYN master-1 -> vip outgoing
-(load balance happens)
-TCP SYN master1 -> master1 incoming
+[kube-apiserver healthcheck]: https://github.com/openshift/installer/docs/dev/kube-apiserver-health-check.md
 
-(server socket accepts, reply generated)
-TCP SYN, ACK master1 -> master1
-```
+## Notes/History
 
-This last packet is dropped, because the client socket is expecting a SYN,ACK with
-a source IP of the VIP, not master1.
+RHCOS also contains a service called `gcp-routes`, which is an older
+version of the `openshift-gcp-routes` code. This is needed on the
+bootstrap node (to allow it to act as an endpoint of the apiserver
+loadbalancer), but it is disabled on all "real" OpenShift nodes.
 
-So, when the apiserver is up, we want to direct all local traffic to ourselves.
-When it is down, we would like it to go over the load balancer.
+(Originally the version of the script in RHCOS was used in OpenShift
+as well, before it was forked into MCO for maintainability reasons.)
 
-See `templates/master/00-master/azure/files/opt-libexec-openshift-azure-routes-sh.yaml`
-
-### Alibaba Cloud
-
-When using an Alibaba Cloud L4 SLB, an ECS instance cannot provide services for clients
-and function as the backend server of the SLB service at the same time. In other words,
-a master cannot hairpin traffic to itself via the load balancer.
-
-So, when the apiserver is up, we want to direct all local traffic to ourselves.
-When it is down, we would like it to go over the load balancer.
-
-See `templates/master/00-master/alibabacloud/files/opt-libexec-openshift-alibabacloud-routes-sh.yaml`
-
-## Functionality
-
-The apiserver-watcher is installed on all the masters and monitors the
-apiserver process /readyz.
-
-When /readyz fails,  write `/run/cloud-routes/$VIP.down`, which tells the
-provider-specific service to update iptables rules. When it is up, write `$VIP.up`.
-
-Separately, a provider-specific process watches that directory and, as necessary,
-updates iptables rules accordingly.
+The word "routes" in the name is an artifact of the original
+implementation of the service, which used routes to handle inbound
+loadbalancer connections rather than iptables rules. However, the
+routing-based implementation could not properly handle graceful
+termination, so it was rewritten.
